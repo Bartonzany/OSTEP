@@ -95,6 +95,8 @@ C 的内存管理没有自动校验，下面这些错编译器一般不吭声，
 
 ## 七、实践作业
 
+代码文件已放在 `OSTEP/homework/vm-api/`（`leak.c` / `overflow.c` / `useafterfree.c` / `null.c` / `vector.c`），`gcc -g -o 名 名.c` 编译后运行。
+
 通过编写含内存错误的程序并使用工具检测，加深对内存管理的理解：
 1. 编写空指针解引用、内存泄漏、缓冲区溢出、悬空指针等错误程序。
 2. 使用`gdb`（带符号编译）调试程序，定位错误位置。
@@ -106,103 +108,156 @@ C 的内存管理没有自动校验，下面这些错编译器一般不吭声，
 
 ```c
 #include <stdlib.h>
+
 int main(void) {
-    int *p = malloc(sizeof(int) * 10);
+    int *p = malloc(sizeof(int) * 10);  // 申请 40 字节
     p[0] = 1;
-    return 0;   // 没 free
+    return 0;  // 没 free，泄漏 40 字节
 }
 ```
 
 ```shell
-valgrind --leak-check=full --show-leak-kinds=all ./leak
+gcc -g -o leak leak.c
+valgrind --leak-check=full ./leak
 ```
 
 ```text
-HEAP SUMMARY:
-    in use at exit: 144 bytes in 3 blocks
-  total heap usage: 3 allocs, 0 frees, 144 bytes allocated
-    definitely lost: 40 bytes in 1 blocks
-ERROR SUMMARY: 1 errors from 1 contexts
+==80125== LEAK SUMMARY:
+==80125==    definitely lost: 40 bytes in 1 blocks
+==80125==    still reachable: 104 bytes in 2 blocks
+==80125== ERROR SUMMARY: 1 errors from 1 contexts
 ```
 
-`definitely lost` 直接点名了那 40 字节（10 个 int）没被释放。
+关键看 `definitely lost: 40 bytes in 1 blocks`——那 40 字节就是 `malloc(10 * sizeof(int))` 申请、却没 `free` 的内存，valgrind 直接点名 `main (leak.c:4)`。其余 104 字节是 libgomp 这类系统库自己留的 `still reachable`（程序退出时数据还在、不算泄漏）。读 valgrind 输出要分清：**`definitely lost` 才是真泄漏，`still reachable` 基本可以忽略**。
 
 ### 2. 缓冲区溢出
 
 ```c
-char *src = "hello";
-char *dst = malloc(strlen(src));   // 少算 \0
-strcpy(dst, src);                  // 溢出 1 字节
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    char *src = "hello";
+    char *dst = malloc(strlen(src));  // strlen 只算 5 个字符，没留 \0
+    strcpy(dst, src);                 // 写入 6 字节（含 \0），越界 1 字节
+    printf("%s\n", dst);
+    free(dst);
+    return 0;
+}
 ```
 
 ```shell
+gcc -g -o overflow overflow.c
 valgrind ./overflow
 ```
 
 ```text
 Invalid write of size 1
-   Address 0x... is 0 bytes after a block of size 5 alloc'd
-ERROR SUMMARY: 1 errors
+   at 0x...: strcpy (...)
+ Address 0x... is 0 bytes after a block of size 5 alloc'd
+ERROR SUMMARY: 2 errors from 2 contexts
 ```
 
-`0 bytes after a block of size 5` 说明越界写了刚好 1 字节（漏掉的 `\0`）。
+`strcpy` 把 `"hello"` 的 6 字节（5 字符 + 结尾 `\0`）拷进只分配了 5 字节的 `dst`，多写出 1 字节。valgrind 说 `0 bytes after a block of size 5`——正是紧挨着 5 字节块末尾、越界写出去的那个 `\0`。
 
 ### 3. 悬空指针（use-after-free）
 
 ```c
-int *x = malloc(sizeof(int));
-*x = 42;
-free(x);
-printf("%d\n", *x);   // 释放后再读
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *x = malloc(sizeof(int));
+    *x = 42;
+    free(x);
+    printf("%d\n", *x);  // 释放后再读：悬空指针
+    return 0;
+}
 ```
 
 ```shell
+gcc -g -o useafterfree useafterfree.c
 valgrind ./useafterfree
 ```
 
 ```text
 Invalid read of size 4
-   Address 0x... is 0 bytes inside a block of size 4 free'd
-ERROR SUMMARY: 1 errors
+   at 0x...: main (useafterfree.c:8)
+ Address 0x... is 0 bytes inside a block of size 4 free'd
+ERROR SUMMARY: 1 errors from 1 contexts
 ```
+
+`free(x)` 之后 `x` 就是悬空指针，`*x` 是"释放后再读"。valgrind 说 `0 bytes inside a block of size 4 free'd`——读的正是已经 free 掉的那 4 字节。顺带一提：编译时 gcc 的 `-Wuse-after-free` 也会直接警告 `pointer 'x' used after 'free'`。运行可能打印出个"看起来正常"的 42（内存还没被覆盖），但纯属侥幸，行为未定义。
 
 ### 4. 空指针解引用 + gdb 定位
 
 ```c
-int *p = 0;
-*p = 1;   // 段错误
-```
+#include <stdio.h>
 
-直接运行得到 `Segmentation fault (core dumped)`。用 gdb 定位崩溃点：
+int main(void) {
+    int *p = 0;  // 空指针
+    *p = 1;      // 解引用 → 段错误
+    return 0;
+}
+```
 
 ```shell
 gcc -g -o null null.c
+./null
+```
+
+```text
+Segmentation fault (core dumped)
+```
+
+用 gdb 定位崩溃点：
+
+```shell
 gdb -batch -ex run -ex bt ./null
 ```
 
 ```text
 Program received signal SIGSEGV, Segmentation fault.
-#0  0x0000aaaaaaaa0728 in main () at null.c:3
+#0  0x0000aaaaaaaa0728 in main () at null.c:5
 ```
 
-`bt`（backtrace）直接指出崩溃在 `null.c:3`。
+`bt`（backtrace）直接指出崩溃在 `null.c:5`，就是 `*p = 1` 那一行。
 
 ### 5. realloc 实现动态向量
 
-用 `realloc` 按需扩容，避免一开始分配过大：
+用 `realloc` 按需扩容（容量不够就翻倍），避免一开始分配过大：
 
 ```c
-int *v = NULL;
-size_t cap = 0, len = 0;
-// 每次追加前：容量不够就翻倍
-if (len == cap) {
-    cap = cap ? cap * 2 : 4;
-    v = realloc(v, cap * sizeof(int));
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *v = NULL;
+    size_t cap = 0, len = 0;
+    for (int x = 0; x < 100; x++) {
+        if (len == cap) {
+            cap = cap ? cap * 2 : 4;      // 初始 4，之后翻倍
+            v = realloc(v, cap * sizeof(int));
+        }
+        v[len++] = x;
+    }
+    printf("len=%zu cap=%zu v[99]=%d\n", len, cap, v[99]);
+    free(v);
+    return 0;
 }
-v[len++] = x;
 ```
 
-对比链表：向量随机访问 O(1)、连续内存缓存友好，但扩容要整体搬移；链表插入删除 O(1)，但随机访问 O(n)、每元素有指针开销。
+```shell
+gcc -g -o vector vector.c
+./vector
+```
+
+```text
+len=100 cap=128 v[99]=99
+```
+
+塞 100 个元素只扩容 6 次（4 → 8 → 16 → 32 → 64 → 128），最后容量 128。对比链表：向量随机访问 O(1)、连续内存缓存友好，但扩容要整体搬移；链表插入删除 O(1)，但随机访问 O(n)、每个元素有指针开销。
 
 ## 八、总结
 
