@@ -112,29 +112,29 @@ Pthread_mutex_unlock(&lock);
 3. 分析`main-signal.c`的低效原因（自旋等待），对比`main-signal-cv.c`（条件变量）的优势，验证helgrind检测结果；
 4. 编写简单多线程程序，练习线程创建、锁、条件变量的组合使用，用helgrind排查问题。
 
-### 1. main-race.c（竞态）
+### 1. main-race.c（竞态，2 个错误）
 
-`balance++` 被主线程和 worker 线程同时无保护访问：
+`balance++` 被主线程和 worker 线程同时无保护访问，helgrind 报两次竞态：
 
 ```shell
-make
 valgrind --tool=helgrind ./main-race
 ```
 
 ```text
-Possible data race during read of size 4 ... by thread #1
+Possible data race during read of size 4 at 0x... by thread #1
+   at 0x...: main (main-race.c:15)     ← 主线程第 15 行 balance++
+This conflicts with a previous write of size 4 by thread #2
+   at 0x...: worker (main-race.c:8)     ← worker 第 8 行 balance++
+Possible data race during write of size 4 ...
    at 0x...: main (main-race.c:15)
-This conflicts with a previous write ... by thread #2
-   at 0x...: worker (main-race.c:8)
-Address ... is 0 bytes inside data symbol "balance"
-ERROR SUMMARY: 2 errors
+ERROR SUMMARY: 2 errors from 2 contexts
 ```
 
-helgrind 精确指出 `balance` 在主线程第 15 行读、worker 第 8 行写，两者冲突。给 `balance++` 加锁后错误消失。
+helgrind 精确指出 `balance` 在 worker 第 8 行写、主线程第 15 行又读又写，两者无锁冲突。给 `balance++` 加锁后就是 0 错误。
 
-### 2. main-deadlock.c（死锁）
+### 2. main-deadlock.c（死锁）vs main-deadlock-global.c
 
-两个线程按**相反顺序**拿 m1、m2，可能互相等锁：
+main-deadlock.c 两个线程按**相反顺序**拿 m1、m2：
 
 ```shell
 valgrind --tool=helgrind ./main-deadlock
@@ -142,27 +142,89 @@ valgrind --tool=helgrind ./main-deadlock
 
 ```text
 Thread #3: lock order "0x... before 0x..." violated
+   at 0x...: worker (main-deadlock.c:10)   ← 线程0 先拿 m1
+   at 0x...: worker (main-deadlock.c:11)   ←      再拿 m2
+   at 0x...: worker (main-deadlock.c:13)   ← 线程1 先拿 m2
+   at 0x...: worker (main-deadlock.c:14)   ←      再拿 m1
 ERROR SUMMARY: 1 errors
 ```
 
-helgrind 报"锁序违反"。`main-deadlock-global.c` 用一个全局大锁 `g` 先包住整个取锁顺序，再 `helgrind` 就不报错——代价是并发度下降。
+helgrind 用"锁获取顺序"报出这个死锁隐患——两个线程拿同一对锁、顺序相反。
 
-### 3. main-signal.c vs main-signal-cv.c（自旋 vs 条件变量）
-
-`main-signal.c` 用 `while (done == 0);` 忙等；`main-signal-cv.c` 用条件变量：
+`main-deadlock-global.c` 加了全局锁 `g`，把"取 m1+m2"整段包起来，运行时不会真死锁；**但 helgrind 仍然报 lock order violated**——因为它检查的是"锁获取顺序是否一致"，不是"这次运行有没有真卡住"。它照样看到线程 0 拿 m1→m2、线程 1 拿 m2→m1，顺序相反，照旧报警：
 
 ```shell
-valgrind --tool=helgrind ./main-signal      # 自旋
-valgrind --tool=helgrind ./main-signal-cv   # 条件变量
+valgrind --tool=helgrind ./main-deadlock-global
 ```
 
 ```text
-main-signal:    Possible data race ... "done"   ERROR SUMMARY: 1 errors
-main-signal-cv:                                  ERROR SUMMARY: 0 errors
+Thread #3: lock order "0x... before 0x..." violated
+ERROR SUMMARY: 1 errors
 ```
 
-自旋版本对 `done` 的读/写无同步，helgrind 报竞态（还烧 CPU）；条件变量版本 0 错误——锁 + `cond_wait` 既省 CPU 又正确。
+所以结论：`g` 能防运行时死锁，但 helgrind 的"锁序检查"仍告警——它报的是潜在锁序不一致，需要你自己判断"到底会不会真死锁"。真正干净的做法是**固定拿锁顺序**（比如都先 m1 后 m2），而不是加全局大锁。
 
-### 4. 组合练习
+### 3. main-signal.c vs main-signal-cv.c（自旋 vs 条件变量）
 
-自己写个"创建线程 + 锁 + 条件变量"的小程序（如生产者-消费者），跑 `helgrind` 确认 0 错误。
+`main-signal.c` 用 `while (done == 0);` 忙等，对 `done` 无同步：
+
+```shell
+valgrind --tool=helgrind ./main-signal
+valgrind --tool=helgrind ./main-signal-cv
+```
+
+```text
+main-signal:    Possible data race ... "done"（main 第 16 行读、worker 第 9 行写）
+                ERROR SUMMARY: 1 errors
+main-signal-cv: ERROR SUMMARY: 0 errors
+```
+
+自旋版本对 `done` 的读/写无同步，helgrind 报竞态（而且忙等还烧 CPU）；条件变量版本用锁 + `cond_wait`，0 错误、也不空转。
+
+### 4. 组合练习（生产者-消费者）
+
+写了个生产者-消费者程序（代码在 `homework/threads-api/main-pc.c`），三样东西全用上：创建/join 线程、`pthread_mutex` 保护缓冲区、两个条件变量（`not_full`/`not_empty`）做"满/空"的等待唤醒：
+
+```c
+#define MAX 10
+int buffer[MAX], count = 0, fill_ptr = 0, use_ptr = 0;
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  not_full  = PTHREAD_COND_INITIALIZER;
+pthread_cond_t  not_empty = PTHREAD_COND_INITIALIZER;
+
+void *producer(void *arg) {
+    for (int i = 0; i < loops; i++) {
+        pthread_mutex_lock(&lock);
+        while (count == MAX) pthread_cond_wait(&not_full, &lock);  // 满等空
+        buffer[fill_ptr] = i; fill_ptr = (fill_ptr+1) % MAX; count++;
+        pthread_cond_signal(&not_empty);                            // 通知有数据
+        pthread_mutex_unlock(&lock);
+    }
+    return NULL;
+}
+void *consumer(void *arg) {
+    int sum = 0;
+    for (int i = 0; i < loops; i++) {
+        pthread_mutex_lock(&lock);
+        while (count == 0) pthread_cond_wait(&not_empty, &lock);    // 空等满
+        sum += buffer[use_ptr]; use_ptr = (use_ptr+1) % MAX; count--;
+        pthread_cond_signal(&not_full);                             // 通知有空位
+        pthread_mutex_unlock(&lock);
+    }
+    printf("consumer sum = %d\n", sum);
+    return NULL;
+}
+```
+
+```shell
+gcc -o main-pc main-pc.c -Wall -pthread
+./main-pc
+valgrind --tool=helgrind ./main-pc
+```
+
+```text
+consumer sum = 499500                     ← 0+1+...+999，全部消费完、无丢失
+ERROR SUMMARY: 0 errors from 0 contexts  ← helgrind 无竞态、无死锁
+```
+
+要点：生产者满了等 `not_full`、消费者空了等 `not_empty`，两边用 `while` 而非 `if` 重查条件；锁只包"放/取 + 改计数"，`signal` 在锁内发送保证原子。所以结果正确（499500）、helgrind 全绿。
